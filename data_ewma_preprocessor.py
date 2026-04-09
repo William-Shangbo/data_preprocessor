@@ -8,10 +8,17 @@ from multiprocessing import Pool
 from pathlib import Path
 
 import pandas as pd
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
-sys.path.append('/Users/shangbo/personal/mytrae/willden/file_method')
-sys.path.append('/Users/shangbo/personal/mytrae/willden/data_method')
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+WILLDEN_FILE_METHOD = WORKSPACE_ROOT / 'willden' / 'file_method'
+WILLDEN_DATA_METHOD = WORKSPACE_ROOT / 'willden' / 'data_method'
+
+for module_path in (WILLDEN_FILE_METHOD, WILLDEN_DATA_METHOD):
+    module_path_str = str(module_path)
+    if module_path.exists() and module_path_str not in sys.path:
+        sys.path.append(module_path_str)
 
 from file_management import quick_read
 from data_processing import rank, TIMEIDS_PER_DAY
@@ -41,6 +48,8 @@ EWMA_FEATURE_SPECS = [
     EwmaFeatureSpec(half_life=239, min_count=1, suffix='ewma_1dhl', cross_day=True),
 ]
 
+EXPECTED_OUTPUT_COLS = len(KEY_COLS) + len(LABEL_COLS) + len(XSEC_RANK_COLS) * (1 + len(EWMA_FEATURE_SPECS))
+
 
 def load_raw_date(file_path, dateid, stockid_range=DEFAULT_STOCKID_RANGE):
     return quick_read(
@@ -56,6 +65,54 @@ def load_raw_daily_shard(raw_daily_dir: str, dateid: int) -> pd.DataFrame:
     if not shard_path.exists():
         return pd.DataFrame()
     return pd.read_parquet(shard_path)
+
+
+def _read_parquet_metadata(path: str | Path) -> tuple[int, int]:
+    parquet_file = pq.ParquetFile(path)
+    return parquet_file.metadata.num_rows, len(parquet_file.schema_arrow.names)
+
+
+def _inspect_output_file(path: str | Path) -> dict:
+    file_path = Path(path)
+    if not file_path.exists():
+        return {'exists': False, 'rows': 0, 'cols': 0, 'readable': False}
+
+    try:
+        rows, cols = _read_parquet_metadata(file_path)
+        return {'exists': True, 'rows': rows, 'cols': cols, 'readable': True}
+    except Exception:
+        return {'exists': True, 'rows': 0, 'cols': 0, 'readable': False}
+
+
+def verify_output_range(output_dir: str, start_dateid: int, end_dateid: int) -> dict:
+    missing_dateids = []
+    unreadable_dateids = []
+    empty_dateids = []
+    schema_mismatch_dateids = []
+    rows_by_dateid = {}
+
+    for dateid in range(start_dateid, end_dateid):
+        output_path = Path(output_dir) / f'd{dateid}.parquet'
+        info = _inspect_output_file(output_path)
+        if not info['exists']:
+            missing_dateids.append(dateid)
+            continue
+        if not info['readable']:
+            unreadable_dateids.append(dateid)
+            continue
+        rows_by_dateid[dateid] = info['rows']
+        if info['rows'] <= 0:
+            empty_dateids.append(dateid)
+        if info['cols'] != EXPECTED_OUTPUT_COLS:
+            schema_mismatch_dateids.append({'dateid': dateid, 'cols': info['cols']})
+
+    return {
+        'missing_dateids': missing_dateids,
+        'unreadable_dateids': unreadable_dateids,
+        'empty_dateids': empty_dateids,
+        'schema_mismatch_dateids': schema_mismatch_dateids,
+        'rows_by_dateid': rows_by_dateid,
+    }
 
 
 def _rank_feature_block(df: pd.DataFrame, source_cols: list[str], suffix: str | None = None) -> pd.DataFrame:
@@ -165,6 +222,11 @@ def build_daily_ewma_packet(
             previous_day_df = load_raw_daily_shard(raw_daily_dir, dateid - 1)
         else:
             previous_day_df = load_raw_date(file_path, dateid - 1, stockid_range=stockid_range)
+        if previous_day_df is None or previous_day_df.empty:
+            raise FileNotFoundError(
+                f'missing previous-day raw data for dateid={dateid - 1}; '
+                f'cross-day EWMA features for dateid={dateid} would be invalid'
+            )
         _log_stage(
             dateid,
             f'loaded previous-day rows={0 if previous_day_df is None else len(previous_day_df)}',
@@ -208,13 +270,16 @@ def build_daily_ewma_packet(
     output_df = pd.concat(output_blocks, axis=1)
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f'd{dateid}.parquet')
-    output_df.to_parquet(output_path, index=False)
+    temp_output_path = f'{output_path}.tmp'
+    output_df.to_parquet(temp_output_path, index=False)
+    os.replace(temp_output_path, output_path)
     _log_stage(dateid, f'finished parquet write path={output_path}', write_start)
 
     elapsed_time = time.time() - start_time
     del day_df, previous_day_df, output_df, output_blocks, imputed_day_source, imputed_cross_day_source, sorted_day_base
     gc.collect()
     return {
+        'status': 'ok',
         'dateid': dateid,
         'output_path': output_path,
         'elapsed_time': elapsed_time,
@@ -222,7 +287,15 @@ def build_daily_ewma_packet(
 
 
 def _process_single_date_worker(args):
-    return build_daily_ewma_packet(*args)
+    dateid = args[1]
+    try:
+        return build_daily_ewma_packet(*args)
+    except Exception as exc:
+        return {
+            'status': 'error',
+            'dateid': dateid,
+            'error': repr(exc),
+        }
 
 
 def process_date_range_serial(
@@ -236,6 +309,7 @@ def process_date_range_serial(
 ):
     dateids = list(range(start_dateid, end_dateid))
     results = []
+    errors = []
     total_start_time = time.time()
 
     for dateid in tqdm(dateids, desc='dateids', total=len(dateids)):
@@ -251,7 +325,7 @@ def process_date_range_serial(
             results.append(result)
 
     total_elapsed_time = time.time() - total_start_time
-    return results, total_elapsed_time
+    return results, errors, total_elapsed_time
 
 
 def process_date_range_parallel(
@@ -271,19 +345,30 @@ def process_date_range_parallel(
 
     total_start_time = time.time()
     results = []
+    errors = []
 
-    with Pool(processes=num_workers) as pool:
+    with Pool(processes=num_workers, maxtasksperchild=1) as pool:
         for result in tqdm(
             pool.imap_unordered(_process_single_date_worker, args_list),
             desc='dateids',
             total=len(args_list),
         ):
+            if result is None:
+                continue
+            if result.get('status') == 'error':
+                errors.append(result)
+                print(
+                    f"[ewma-pre] dateid={result['dateid']} worker_error={result['error']}",
+                    flush=True,
+                )
+                continue
             if result is not None:
                 results.append(result)
 
     total_elapsed_time = time.time() - total_start_time
     results.sort(key=lambda item: item['dateid'])
-    return results, total_elapsed_time
+    errors.sort(key=lambda item: item['dateid'])
+    return results, errors, total_elapsed_time
 
 
 def main():
@@ -313,28 +398,55 @@ def main():
         default=DEFAULT_IMPUTE_HALF_LIFE,
         help='Half-life used by causal EWMA imputation on raw values',
     )
+    parser.add_argument(
+        '--skip_existing',
+        action='store_true',
+        help='Skip dateids whose output parquet already exists and is readable',
+    )
 
     args = parser.parse_args()
     if not args.file_path and not args.raw_daily_dir:
         raise ValueError('Either --file_path or --raw_daily_dir must be provided')
 
+    start_dateid = args.start_dateid
+    end_dateid = args.end_dateid
+    if args.skip_existing:
+        pending_dateids = []
+        for dateid in range(start_dateid, end_dateid):
+            output_path = Path(args.output_dir) / f'd{dateid}.parquet'
+            info = _inspect_output_file(output_path)
+            if info['exists'] and info['readable'] and info['rows'] > 0:
+                continue
+            pending_dateids.append(dateid)
+
+        if not pending_dateids:
+            print('All requested dateids already have readable outputs; verifying range only.')
+            start_dateid = end_dateid
+        else:
+            start_dateid = pending_dateids[0]
+            end_dateid = pending_dateids[-1] + 1
+            print(
+                f"skip_existing enabled; pending dateids={pending_dateids} "
+                f"collapsed_to_contiguous_range=[{start_dateid}, {end_dateid})"
+            )
+
     if args.mode == 'parallel':
-        results, total_elapsed_time = process_date_range_parallel(
+        results, errors, total_elapsed_time = process_date_range_parallel(
             file_path=args.file_path,
             raw_daily_dir=args.raw_daily_dir,
             output_dir=args.output_dir,
-            start_dateid=args.start_dateid,
-            end_dateid=args.end_dateid,
+            start_dateid=start_dateid,
+            end_dateid=end_dateid,
             num_workers=args.num_workers,
             impute_half_life=args.impute_half_life,
         )
     else:
-        results, total_elapsed_time = process_date_range_serial(
+        results, errors, total_elapsed_time = process_date_range_serial(
             file_path=args.file_path,
             raw_daily_dir=args.raw_daily_dir,
             output_dir=args.output_dir,
-            start_dateid=args.start_dateid,
-            end_dateid=args.end_dateid,
+            start_dateid=start_dateid,
+            end_dateid=end_dateid,
             impute_half_life=args.impute_half_life,
         )
 
@@ -343,6 +455,20 @@ def main():
         print(
             f"dateid={result['dateid']} elapsed={result['elapsed_time']:.2f}s output={result['output_path']}"
         )
+    if errors:
+        print('\nWorker errors:')
+        for error in errors:
+            print(f"dateid={error['dateid']} error={error['error']}")
+
+    verification = verify_output_range(args.output_dir, args.start_dateid, args.end_dateid)
+    print('\nVerification summary:')
+    print(f"missing_dateids={verification['missing_dateids']}")
+    print(f"unreadable_dateids={verification['unreadable_dateids']}")
+    print(f"empty_dateids={verification['empty_dateids']}")
+    print(f"schema_mismatch_dateids={verification['schema_mismatch_dateids']}")
+
+    if errors or verification['missing_dateids'] or verification['unreadable_dateids'] or verification['empty_dateids']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
